@@ -1,0 +1,41 @@
+# Secrets — .env holds a production eBay Cert ID and NetSuite TBA tokens.
+# Never commit this file. If it ever was committed, the secret must be rotated;
+# removing it in a later commit does not help, it stays in history.
+.env
+.env.*
+!.env.example
+
+# No images belong in this repo. Screenshots of NetSuite or eBay setup pages
+# routinely contain token IDs, secrets and keys in plain sight, and secret
+# scanners do not read pictures.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+
+# Anything that looks like a credential dump
+*credential*
+*secret*
+*token*
+*.pem
+*.key
+*.p12
+
+# Virtual environment — recreate with: python -m venv .venv
+.venv/
+venv/
+
+# Test media
+*.mp4
+*.mov
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
