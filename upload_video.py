@@ -1,21 +1,55 @@
 #!/usr/bin/env python3
 """
-BCS-421 — upload NetSuite item videos to eBay's Media API.
+BCS-421 — put NetSuite item videos onto eBay.
 
-Replaces the Celigo A2 step, which cannot carry binary.
+Runs the whole video pipeline. Celigo keeps only the existing listing flow,
+which reads custitem_nr_video_id from the item saved search; everything that
+talks to eBay's Media API happens here, because Celigo's NetSuite connector
+cannot carry binary and SuiteScript cannot read a file over 10 MB.
+
+A run does three things, in this order:
+
+  1. reconcile  anything left at UPLOADED by an earlier run — ask eBay once
+                and move it on. eBay allows up to 48 hours to process.
+  2. register   items with a video file and no video id — POST /video,
+                capture the id from the Location header.
+  3. upload     everything at REGISTERED — send the bytes, poll to LIVE.
+
+So a newly catalogued item goes from "video attached" to LIVE in one pass,
+and anything that stalls is picked up by the next run.
+
+Status lives on the item (custitem_nr_video_status); history lives in
+customrecord_nr_video_log, one row per attempt.
 
 Modes
 -----
-  python upload_video.py --test-netsuite
-      Run the queue query and print what it finds. Changes nothing.
-
   python upload_video.py
-      Batch: every item at status REGISTERED gets uploaded, then written
-      back to UPLOADED (and LIVE if eBay finishes while we're watching).
+      The batch run above. This is what the schedule calls.
+
+  python upload_video.py --test-netsuite
+      Print the upload queue. Changes nothing.
+
+  python upload_video.py --diagnose
+      Ten counting queries showing what this role can see. Changes nothing.
+
+  python upload_video.py --register-new
+      Step 2 only.
+
+  python upload_video.py --reconcile
+      Step 1 only.
+
+  python upload_video.py --register <itemId>
+      Register one item by hand.
+
+  python upload_video.py --set-status <itemId> <STATUS>
+      Force a status, verified. Used to re-queue a failed item.
+
+  python upload_video.py --test-log <itemId>
+      Write one field and one log row, then read them back.
 
   python upload_video.py <videoId> <fileUrl>
-      Single item, manual. No NetSuite involved. This is the mode that
-      proved the upload works on 2026-09-29.
+      Upload one file to one video id. No NetSuite. This is the mode that
+      first proved the upload works, on 2026-09-29.
 """
 import os, sys, time, tempfile, requests
 
@@ -149,14 +183,14 @@ def ns_diagnose():
     print()
 
 
-def ns_query(sql):
+def ns_query(sql, timeout=60):
     """Any SuiteQL query. Returns the rows."""
     r = requests.post(
         f"{NS_REST}/query/v1/suiteql",
         auth=ns_auth(),
         headers={"Content-Type": "application/json", "Prefer": "transient"},
         json={"q": sql},
-        timeout=60,
+        timeout=timeout,
     )
     if r.status_code != 200:
         print(f"SuiteQL -> HTTP {r.status_code}\n{r.text[:600]}")
@@ -209,29 +243,32 @@ def ns_set_fields(item_id, values, verify=True):
     return True
 
 
-def ebay_register(token, item_id):
-    """
-    Register a video with eBay and record the ID on the item.
+# Items with a video file attached that have never been registered with eBay.
+#
+# This was Celigo flow A1. It lives here because A1 could not survive contact
+# with a second item: its `size` was hardcoded, since a saved search cannot
+# reach `filesize` through a Document-type field. SuiteQL's item->file join
+# can, so this reads the real byte count per item -- which is mandatory, as
+# eBay rejects a mismatch with error 190007.
+NEW_SQL = """
+SELECT
+    i.id         AS item_id,
+    i.itemid     AS sku,
+    f.id         AS file_id,
+    f.name       AS file_name,
+    f.filesize   AS file_size
+FROM item i
+JOIN file f ON f.id = i.custitem_nr_video
+WHERE i.custitem_nr_video_id IS NULL
+"""
 
-    In production this is Celigo flow A1. It lives here so the pipeline can be
-    tested end to end without a round trip through Celigo, and because it
-    demonstrates the fix for A1's hardcoded `size`: the byte count comes from
-    SuiteQL's item->file join, which the saved search could not produce.
-    """
-    rows = ns_query(f"""
-        SELECT i.id AS item_id, i.itemid AS sku,
-               f.id AS file_id, f.name AS file_name, f.filesize AS file_size
-        FROM item i
-        JOIN file f ON f.id = i.custitem_nr_video
-        WHERE i.id = {int(item_id)}
-    """)
-    if not rows:
-        sys.exit(f"item {item_id} has no video file attached (custitem_nr_video is empty)")
 
-    row  = rows[0]
-    size = int(row["file_size"])
-    print(f"{row['sku']}  item {item_id}")
-    print(f"  file {row['file_id']}  {row['file_name']}  {size:,} bytes")
+def _register_one(token, row):
+    """Register one already-fetched row with eBay and write the ID back."""
+    item_id = row["item_id"]
+    size    = int(row["file_size"])
+    print(f"{row.get('sku')}  item {item_id}")
+    print(f"  file {row.get('file_id')}  {row.get('file_name')}  {size:,} bytes")
 
     r = requests.post(
         f"{MEDIA_BASE}/video",
@@ -246,13 +283,13 @@ def ebay_register(token, item_id):
         timeout=60,
     )
     if r.status_code != 201:
-        sys.exit(f"createVideo -> HTTP {r.status_code}: {r.text[:400]}")
+        raise RuntimeError(f"createVideo -> HTTP {r.status_code}: {r.text[:400]}")
 
     # The body is empty. The ID is only in the Location response header.
     location = r.headers.get("Location", "")
     video_id = location.rstrip("/").rsplit("/", 1)[-1]
     if len(video_id) != 32:
-        sys.exit(f"could not read a video id from Location header: {location!r}")
+        raise RuntimeError(f"could not read a video id from Location header: {location!r}")
 
     print(f"  registered {video_id}")
     ok = ns_set_fields(item_id, {
@@ -260,14 +297,52 @@ def ebay_register(token, item_id):
         "custitem_nr_video_status": "REGISTERED",
     })
     if not ok:
-        sys.exit(
-            f"\neBay registered video {video_id} but NetSuite did not store it.\n"
-            f"That video id is now orphaned - it exists on eBay and nothing in\n"
-            f"NetSuite points at it. Fix the write before retrying, or you will\n"
-            f"leak a registered video every attempt."
+        # Stop this item rather than retry it. eBay has issued a video id that
+        # NetSuite does not know about; trying again just issues another one.
+        raise RuntimeError(
+            f"eBay registered video {video_id} but NetSuite did not store it. "
+            f"That id is now orphaned - it exists on eBay and nothing points at "
+            f"it. Fix the write before retrying, or every attempt leaks another."
         )
     print(f"  NetSuite: item {item_id} -> REGISTERED")
     return video_id
+
+
+def ebay_register(token, item_id):
+    """Register one item by id. Used by --register for manual testing."""
+    rows = ns_query(f"""
+        SELECT i.id AS item_id, i.itemid AS sku,
+               f.id AS file_id, f.name AS file_name, f.filesize AS file_size
+        FROM item i
+        JOIN file f ON f.id = i.custitem_nr_video
+        WHERE i.id = {int(item_id)}
+    """)
+    if not rows:
+        sys.exit(f"item {item_id} has no video file attached (custitem_nr_video is empty)")
+    try:
+        return _register_one(token, rows[0])
+    except RuntimeError as e:
+        sys.exit(f"\n{e}")
+
+
+def register_new(token, rows):
+    """
+    Register every item that has a video file and no video id yet.
+
+    One failure does not stop the rest: each item is independent, and a batch
+    that aborts halfway leaves the operator guessing which half ran.
+    """
+    print(f"{len(rows)} item(s) with a video file and no video id")
+    registered = 0
+    for row in rows:
+        try:
+            _register_one(token, row)
+            registered += 1
+        except Exception as e:
+            print(f"  ! {row.get('sku')} item={row['item_id']}: {e}")
+            ns_log(row["item_id"], "", "FAILED", f"register: {e}")
+    print(f"registered {registered} of {len(rows)}\n")
+    return registered
 
 
 def ns_set_status(item_id, status, note=None):
@@ -543,6 +618,14 @@ if __name__ == "__main__":
         ns_diagnose()
         sys.exit(0)
 
+    if args == ["--register-new"]:
+        newcomers = ns_query(NEW_SQL, timeout=180)
+        if not newcomers:
+            print("nothing to register — every item with a video file has an id")
+            sys.exit(0)
+        register_new(get_access_token(), newcomers)
+        sys.exit(0)
+
     if args == ["--reconcile"]:
         stragglers = ns_query(UPLOADED_SQL)
         if not stragglers:
@@ -620,18 +703,27 @@ if __name__ == "__main__":
     if args:
         sys.exit(__doc__)
 
-    rows       = ns_queue()                   # batch mode
+    # Batch mode: the whole pipeline in one pass.
+    #   1. reconcile  — anything left at UPLOADED by an earlier run
+    #   2. register   — items with a video file and no video id      (was A1)
+    #   3. upload     — everything at REGISTERED                     (was A2)
+    # A brand new item goes from "video attached" to LIVE in one run.
     stragglers = ns_query(UPLOADED_SQL)
+    newcomers  = ns_query(NEW_SQL, timeout=180)
+    rows       = ns_queue()
 
-    if not rows and not stragglers:
-        print("nothing at REGISTERED or UPLOADED — nothing to do")
+    if not (stragglers or newcomers or rows):
+        print("nothing to do — no items waiting at any stage")
         sys.exit(0)
 
     token = get_access_token()
 
-    # Clear the backlog before taking on new work. If eBay is slow or down,
-    # yesterday's items are the ones closest to being finished.
+    # Backlog first. If eBay is slow, yesterday's items are closest to done.
     reconcile(token, stragglers)
+
+    if newcomers:
+        register_new(token, newcomers)
+        rows = ns_queue()        # re-read: the ones just registered are queued now
 
     if not rows:
         sys.exit(0)
