@@ -415,6 +415,85 @@ def poll(token, video_id, attempts=20, delay=15):
     return None
 
 
+UPLOADED_SQL = """
+SELECT
+    i.id                   AS item_id,
+    i.itemid               AS sku,
+    i.custitem_nr_video_id AS video_id
+FROM item i
+WHERE i.custitem_nr_video_status = 'UPLOADED'
+  AND i.custitem_nr_video_id IS NOT NULL
+"""
+
+
+def ns_set_expiration(item_id, expires):
+    """
+    Write eBay's expirationDate onto the item.
+
+    Written unverified on purpose: eBay returns ISO 8601
+    ('2026-11-06T19:54:56Z') and NetSuite stores and returns date/time
+    fields in its own display format, so a string read-back would always
+    look like a mismatch even on a successful write.
+    """
+    if not expires:
+        return
+    ns_set_fields(item_id,
+                  {"custitem_nr_video_expiration": expires},
+                  verify=False)
+
+
+def reconcile(token, rows):
+    """
+    Pick up anything left at UPLOADED by an earlier run.
+
+    A single run polls for five minutes. eBay allows up to 48 hours to
+    process a video, and up to seven business days when a review queue is
+    backed up. Without this pass, a video that outlasts its own run would
+    sit at UPLOADED forever: nothing would move it to LIVE, and the item
+    would list with no video and no error anywhere.
+
+    This is what the planned Celigo flow A3 was for. It lives here instead
+    because this script already runs on a schedule and already has the
+    polling code, so a third flow and a second schedule would be two more
+    things to maintain for the same outcome. It also covers a case A3 could
+    not: a run that dies after the upload but before the poll.
+    """
+    if not rows:
+        return
+
+    print(f"{len(rows)} item(s) left at UPLOADED from an earlier run")
+    for row in rows:
+        item_id  = row["item_id"]
+        video_id = row["video_id"]
+        sku      = row.get("sku")
+        try:
+            r = requests.get(
+                f"{MEDIA_BASE}/video/{video_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            body   = r.json()
+            status = body.get("status")
+            print(f"  {sku}  item={item_id}  eBay says {status}")
+
+            if status == "LIVE":
+                expires = body.get("expirationDate", "")
+                ns_set_status(item_id, "LIVE", f"live on eBay, expires {expires}")
+                ns_set_expiration(item_id, expires)
+                ns_log(item_id, video_id, "LIVE", f"expires {expires} (reconciled)")
+
+            elif status in ("BLOCKED", "PROCESSING_FAILED", "REJECTED"):
+                ns_set_status(item_id, "UPLOAD_FAILED", f"eBay reports {status}")
+                ns_log(item_id, video_id, "FAILED", f"eBay reports {status}")
+
+            # Still PROCESSING: leave it alone, try again tomorrow.
+
+        except Exception as e:
+            print(f"  ! {sku} item={item_id}: {type(e).__name__}: {e}")
+    print()
+
+
 def process(token, item):
     """One item, end to end. Returns True if eBay accepted the bytes."""
     item_id  = item["item_id"]
@@ -437,8 +516,9 @@ def process(token, item):
 
         result = poll(token, video_id)
         if result:
-            expires = result.get("expirationDate", "unknown")
+            expires = result.get("expirationDate", "")
             ns_set_status(item_id, "LIVE", f"live on eBay, expires {expires}")
+            ns_set_expiration(item_id, expires)
             ns_log(item_id, video_id, "LIVE", f"expires {expires}", size)
         else:
             ns_log(item_id, video_id, "UPLOADED",
@@ -461,6 +541,14 @@ if __name__ == "__main__":
 
     if args == ["--diagnose"]:
         ns_diagnose()
+        sys.exit(0)
+
+    if args == ["--reconcile"]:
+        stragglers = ns_query(UPLOADED_SQL)
+        if not stragglers:
+            print("nothing at UPLOADED")
+            sys.exit(0)
+        reconcile(get_access_token(), stragglers)
         sys.exit(0)
 
     if args == ["--test-netsuite"]:
@@ -532,12 +620,22 @@ if __name__ == "__main__":
     if args:
         sys.exit(__doc__)
 
-    rows = ns_queue()                         # batch mode
-    if not rows:
-        print("nothing at REGISTERED — nothing to do")
+    rows       = ns_queue()                   # batch mode
+    stragglers = ns_query(UPLOADED_SQL)
+
+    if not rows and not stragglers:
+        print("nothing at REGISTERED or UPLOADED — nothing to do")
         sys.exit(0)
 
     token = get_access_token()
+
+    # Clear the backlog before taking on new work. If eBay is slow or down,
+    # yesterday's items are the ones closest to being finished.
+    reconcile(token, stragglers)
+
+    if not rows:
+        sys.exit(0)
+
     print(f"{len(rows)} item(s) to upload")
     failures = 0
     for row in rows:
